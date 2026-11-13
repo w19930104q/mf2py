@@ -1,6 +1,10 @@
 # Change Log
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+### New Features
+- Add opt-in include-pattern expansion (`include=True`): `<a class="include" href="#id">` and `<object class="include" data="#id">` references to same-page fragments are replaced by a copy of the referenced subtree before microformats1/microformats2 extraction. Unexpandable references (self/ancestor/circular references, missing or duplicate ids, missing or external references) produce locatable diagnostics in `debug["include-diagnostics"]` without aborting the parse; expansion is capped by `include_max_nodes` and exceeding the cap raises `mf2py.IncludeLimitExceeded`. Default behaviour is unchanged.
+
 ## 2.0.2 - 2026-09-17
 This release adds support for Python 3.13 and 3.14.
 

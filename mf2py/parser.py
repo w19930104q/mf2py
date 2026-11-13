@@ -8,6 +8,7 @@ from bs4.element import Tag
 from . import (
     backcompat,
     implied_properties,
+    includes,
     metaformats,
     mf2_classes,
     parse_property,
@@ -26,6 +27,8 @@ def parse(
     expose_dom=False,
     filter_roots=False,
     metaformats=False,
+    include=False,
+    include_max_nodes=includes.DEFAULT_MAX_NODES,
 ):
     """
     Parse a document or URL for microformats and return a dictionary in mf2json format.
@@ -46,6 +49,15 @@ def parse(
         and Twitter card data: https://microformats.org/wiki/metaformats
       filter_roots (boolean or list): optional, filter root class names. Use
         True to filter known conflicting classes, otherwise filter given list.
+      include (boolean): optional, expand classic include-pattern references
+        (`<a class="include" href="#id">` and `<object class="include"
+        data="#id">`) before parsing. Only same-page fragment references are
+        supported; external documents are never fetched. Defaults to False.
+      include_max_nodes (int or None): optional, cap on the total number of
+        DOM nodes inserted by include expansion. Exceeding the cap raises
+        `mf2py.includes.IncludeLimitExceeded` and no result is delivered.
+        None disables the cap (not recommended). Defaults to
+        `mf2py.includes.DEFAULT_MAX_NODES`.
 
     Return: a mf2json dict representing the structured data in the document
 
@@ -58,6 +70,8 @@ def parse(
         expose_dom=expose_dom,
         metaformats=metaformats,
         filter_roots=filter_roots,
+        include=include,
+        include_max_nodes=include_max_nodes,
     ).to_dict()
 
 
@@ -81,9 +95,20 @@ class Parser(object):
         and Twitter card data: https://microformats.org/wiki/metaformats
       filter_roots (boolean or list): optional, filter root class names. Use
         True to filter known conflicting classes, otherwise filter given list.
+      include (boolean): optional, expand classic include-pattern references
+        (`<a class="include" href="#id">` and `<object class="include"
+        data="#id">`) before parsing. Only same-page fragment references are
+        supported; external documents are never fetched. Defaults to False.
+      include_max_nodes (int or None): optional, cap on the total number of
+        DOM nodes inserted by include expansion. Exceeding the cap raises
+        `mf2py.includes.IncludeLimitExceeded` and no result is delivered.
+        None disables the cap (not recommended). Defaults to
+        `mf2py.includes.DEFAULT_MAX_NODES`.
 
     Attributes:
       useragent (string): the User-Agent string for the Parser
+      include_diagnostics (list): diagnostics collected while expanding
+        include-pattern references (only populated when include=True)
 
     """
 
@@ -100,9 +125,12 @@ class Parser(object):
         expose_dom=False,
         metaformats=False,
         filter_roots=False,
+        include=False,
+        include_max_nodes=includes.DEFAULT_MAX_NODES,
     ):
         self.__url__ = None
         self.__doc__ = None
+        self.__parse_doc__ = None
         self._preserve_doc = False
         self.__parsed__ = {
             "items": [],
@@ -117,6 +145,8 @@ class Parser(object):
         self.lang = None
         self.expose_dom = expose_dom
         self.__metaformats = metaformats
+        self.__include = include
+        self.include_diagnostics = []
         try:
             self.filtered_roots = set(filter_roots)
         except TypeError:
@@ -188,6 +218,18 @@ class Parser(object):
                         self.__url__ = try_urljoin(self.__url__, poss_base_url)
 
         if self.__doc__ is not None:
+            if self.__include:
+                # expand include-pattern references on an internal copy;
+                # self.__doc__ stays untouched so that the caller's document
+                # is never modified and rels are collected from the original
+                self.__parse_doc__ = includes.expand(
+                    self.__doc__,
+                    max_nodes=include_max_nodes,
+                    diagnostics=self.include_diagnostics,
+                )
+            else:
+                self.__parse_doc__ = self.__doc__
+
             if document := self.__doc__.find("html"):
                 self.lang = document.attrs.get("lang")
             # parse!
@@ -553,12 +595,16 @@ class Parser(object):
             self.__metaformats_item = metaformats.parse(self.__doc__, url=self.__url__)
 
         # start parsing at root element of the document
-        parse_el(self.__doc__, ctx)
+        # (__parse_doc__ is the include-expanded copy when include=True,
+        # otherwise the document itself)
+        parse_el(self.__parse_doc__, ctx)
         self.__parsed__["items"] = ctx
         if self.__metaformats and self.__metaformats_item:
             self.__parsed__["items"].append(self.__metaformats_item)
 
         # parse for rel values
+        # always collected from the original document, never from the
+        # include-expanded copy
         for el in get_descendents(self.__doc__):
             if el.name in ("a", "area", "link") and el.has_attr("rel"):
                 parse_rels(el)
@@ -575,6 +621,10 @@ class Parser(object):
             self.__parsed__["debug"]["markup parser"] = self.__html_parser__
         else:
             self.__parsed__["debug"]["markup parser"] = "unknown"
+
+        # expose include-pattern diagnostics, if include mode was enabled
+        if self.__include:
+            self.__parsed__["debug"]["include-diagnostics"] = self.include_diagnostics
 
     def to_dict(self, filter_by_type=None):
         """Get a dictionary version of the parsed microformat document.

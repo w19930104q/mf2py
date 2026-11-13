@@ -111,6 +111,36 @@ found.
 Use `filter_roots=True` to filter known conflicting user names (e.g. Tailwind).
 Otherwise provide a custom list to filter instead.
 
+### `include`
+
+Use `include=True` to expand the classic
+[include-pattern](https://microformats.org/wiki/include-pattern) before parsing.
+Pages that carry many records (e.g. an event listing) can keep shared data such
+as venue information in one fragment and reference it from every record with
+`<a class="include" href="#venue"></a>` or
+`<object class="include" data="#venue"></object>`.
+
+Only same-page `#id` fragment references are supported; external pages are never
+fetched. Each reference element is replaced by a copy of the referenced subtree
+before microformats1/microformats2 extraction, so nested `h-*` scoping, the
+value-class-pattern and implied properties all work on the expanded content.
+Repeated references keep their duplicate values. The reference element's own
+class names are ignored.
+
+References that cannot be expanded (self references, references to an ancestor,
+indirect reference loops, missing or duplicate ids, missing or external
+references) are left unexpanded and reported as locatable diagnostics in
+`result["debug"]["include-diagnostics"]` (and on `Parser.include_diagnostics`);
+parsing of the rest of the document continues. Includes inside `e-*` properties
+are not expanded, so `e-*` keeps outputting the originally authored HTML, and
+rels are always collected from the original document. The caller's document is
+never modified.
+
+Expansion is capped at `include_max_nodes` DOM nodes (default
+`mf2py.includes.DEFAULT_MAX_NODES`); exceeding the cap raises
+`mf2py.IncludeLimitExceeded` so no silently truncated data is delivered. Pass
+`include_max_nodes=None` to disable the cap (not recommended).
+
 ## Advanced Usage
 
 `parse` is a convenience function for `Parser`. More sophisticated behaviors are
