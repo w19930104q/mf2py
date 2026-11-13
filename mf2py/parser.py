@@ -13,6 +13,11 @@ from . import (
     parse_property,
     temp_fixes,
 )
+from .audit import (
+    ShadowEntity,
+    audit_entries,
+    build_node_path_map,
+)
 from .dom_helpers import get_attr, get_children, get_descendents, try_urljoin
 from .mf_helpers import unordered_list
 from .version import __version__
@@ -26,6 +31,7 @@ def parse(
     expose_dom=False,
     filter_roots=False,
     metaformats=False,
+    audit=False,
 ):
     """
     Parse a document or URL for microformats and return a dictionary in mf2json format.
@@ -46,6 +52,9 @@ def parse(
         and Twitter card data: https://microformats.org/wiki/metaformats
       filter_roots (boolean or list): optional, filter root class names. Use
         True to filter known conflicting classes, otherwise filter given list.
+      audit (boolean): optional, collect provenance for every properties-array
+        element. Defaults to False; when False parsing behaves exactly as
+        before. Access the audit trail via :meth:`Parser.audit`.
 
     Return: a mf2json dict representing the structured data in the document
 
@@ -58,6 +67,7 @@ def parse(
         expose_dom=expose_dom,
         metaformats=metaformats,
         filter_roots=filter_roots,
+        audit=audit,
     ).to_dict()
 
 
@@ -81,6 +91,8 @@ class Parser(object):
         and Twitter card data: https://microformats.org/wiki/metaformats
       filter_roots (boolean or list): optional, filter root class names. Use
         True to filter known conflicting classes, otherwise filter given list.
+      audit (boolean): optional, collect provenance for every properties-array
+        element. Off by default. See :meth:`audit`.
 
     Attributes:
       useragent (string): the User-Agent string for the Parser
@@ -100,10 +112,19 @@ class Parser(object):
         expose_dom=False,
         metaformats=False,
         filter_roots=False,
+        audit=False,
     ):
         self.__url__ = None
         self.__doc__ = None
         self._preserve_doc = False
+        self.audit_enabled = bool(audit)
+        # parallel shadow tree: ShadowEntity objects aligned with parsed items
+        self._audit_shadows = []
+        # id(tag) -> node path, built from the original DOM on demand
+        self._audit_path_map = None
+        # backcompat provenance registry (originals + MF1 mappings), reused
+        # for every backcompat root in this document
+        self._audit_registry = backcompat._new_audit_registry() if audit else None
         self.__parsed__ = {
             "items": [],
             "rels": {},
@@ -211,6 +232,7 @@ class Parser(object):
             value_property=None,
             simple_value=None,
             backcompat_mode=False,
+            original_el=None,
         ):
             """Handles a (possibly nested) microformat, i.e. h-*"""
             properties = {}
@@ -219,9 +241,27 @@ class Parser(object):
             # for processing implied properties: collects if property types (p, e, u, d(t)) or children (h) have been processed
             parsed_types_aggregation = set()
 
+            # provenance counterpart of this item; None unless auditing
+            shadow = (
+                ShadowEntity(
+                    original_el if original_el is not None else el,
+                    mf1=(
+                        {"root": " ".join(root_class_names)}
+                        if backcompat_mode
+                        else None
+                    ),
+                )
+                if self.audit_enabled
+                else None
+            )
+
             if backcompat_mode:
                 el = backcompat.apply_rules(
-                    el, self.__html_parser__, self.filtered_roots
+                    el,
+                    self.__html_parser__,
+                    self.filtered_roots,
+                    audit=self.audit_enabled,
+                    registry=self._audit_registry,
                 )
                 root_class_names = mf2_classes.root(
                     el.get("class", []), self.filtered_roots
@@ -235,6 +275,7 @@ class Parser(object):
                     child_props,
                     child_children,
                     child_parsed_types_aggregation,
+                    child_shadows,
                 ) = parse_props(child, root_lang)
                 for key, new_value in child_props.items():
                     prop_value = properties.get(key, [])
@@ -242,6 +283,12 @@ class Parser(object):
                     properties[key] = prop_value
                 children.extend(child_children)
                 parsed_types_aggregation.update(child_parsed_types_aggregation)
+                if shadow is not None:
+                    for key, new_shadows in child_shadows.items():
+                        if key == "__children__":
+                            shadow.children.extend(new_shadows)
+                        else:
+                            shadow.properties.setdefault(key, []).extend(new_shadows)
 
             # complex h-* objects can take their "value" from the
             # first explicit property ("name" for p-* or "url" for u-*)
@@ -254,24 +301,44 @@ class Parser(object):
                 if "name" not in properties and parsed_types_aggregation.isdisjoint(
                     "peh"
                 ):
-                    properties["name"] = [
-                        implied_properties.name(el, self.__url__, self.filtered_roots)
-                    ]
+                    trace = [] if self.audit_enabled else None
+                    implied_name = implied_properties.name(
+                        el, self.__url__, self.filtered_roots, trace=trace
+                    )
+                    properties["name"] = [implied_name]
+                    if shadow is not None:
+                        shadow.properties["name"] = trace
 
                 if "photo" not in properties and parsed_types_aggregation.isdisjoint(
                     "uh"
                 ):
-                    x = implied_properties.photo(el, self.__url__, self.filtered_roots)
+                    trace = [] if self.audit_enabled else None
+                    x = implied_properties.photo(
+                        el,
+                        self.__url__,
+                        self.filtered_roots,
+                        trace=trace,
+                    )
                     if x is not None:
                         properties["photo"] = [x]
+                        if shadow is not None:
+                            shadow.properties["photo"] = trace
 
                 # stop implied url if any u-* or h-* is already found
                 if "url" not in properties and parsed_types_aggregation.isdisjoint(
                     "uh"
                 ):
-                    x = implied_properties.url(el, self.__url__, self.filtered_roots)
+                    trace = [] if self.audit_enabled else None
+                    x = implied_properties.url(
+                        el,
+                        self.__url__,
+                        self.filtered_roots,
+                        trace=trace,
+                    )
                     if x is not None:
                         properties["url"] = [x]
+                        if shadow is not None:
+                            shadow.properties["url"] = trace
 
             # build microformat with type and properties
             microformat = {
@@ -311,14 +378,26 @@ class Parser(object):
                 microformat["lang"] = root_lang
             elif self.lang:
                 microformat["lang"] = self.lang
-            return microformat
+            return microformat, shadow
 
         def parse_props(el, root_lang):
-            """Parse the properties from a single element"""
+            """Parse the properties from a single element.
+
+            Returns (props, children, parsed_types_aggregation, shadows);
+            ``shadows`` maps property names to provenance leaves/entities and
+            uses the "__children__" key for child microformat shadows.
+            """
             props = {}
             children = []
             # for processing implied properties: collects if property types (p, e, u, d(t)) or children (h) have been processed
             parsed_types_aggregation = set()
+            shadows = {}
+            if self.audit_enabled:
+                shadows["__children__"] = []
+
+            def attach(prop_name, leaf_or_entity):
+                if self.audit_enabled:
+                    shadows.setdefault(prop_name, []).append(leaf_or_entity)
 
             classes = el.get("class", [])
             filtered_classes = mf2_classes.filter_classes(classes)
@@ -338,8 +417,16 @@ class Parser(object):
             # False is default
             is_property_el = False
 
+            # mf1 mapping info recorded on backcompat copies
+            mf1_info = (
+                backcompat.audit_mf1(self._audit_registry, el)
+                if self.audit_enabled
+                else None
+            )
+
             # Parse plaintext p-* properties.
             p_value = None
+            p_trace = [] if self.audit_enabled else None
             for prop_name in filtered_classes["p"]:
                 is_property_el = True
                 parsed_types_aggregation.add("p")
@@ -347,23 +434,31 @@ class Parser(object):
 
                 # if value has not been parsed then parse it
                 if p_value is None:
-                    p_value = parse_property.text(el, base_url=self.__url__)
+                    p_value = parse_property.text(
+                        el, base_url=self.__url__, trace=p_trace
+                    )
 
                 if root_class_names:
-                    prop_value.append(
-                        handle_microformat(
-                            root_class_names,
-                            el,
-                            value_property="name",
-                            simple_value=p_value,
-                            backcompat_mode=backcompat_mode,
-                        )
+                    mf, entity_shadow = handle_microformat(
+                        root_class_names,
+                        el,
+                        value_property="name",
+                        simple_value=p_value,
+                        backcompat_mode=backcompat_mode,
                     )
+                    prop_value.append(mf)
+                    attach(prop_name, entity_shadow)
                 else:
                     prop_value.append(p_value)
+                    if p_trace is not None:
+                        leaf = p_trace[-1]
+                        if mf1_info is not None:
+                            leaf = dict(leaf, mf1=mf1_info)
+                        attach(prop_name, leaf)
 
             # Parse URL u-* properties.
             u_value = None
+            u_trace = [] if self.audit_enabled else None
             for prop_name in filtered_classes["u"]:
                 is_property_el = True
                 parsed_types_aggregation.add("u")
@@ -371,26 +466,34 @@ class Parser(object):
 
                 # if value has not been parsed then parse it
                 if u_value is None:
-                    u_value = parse_property.url(el, base_url=self.__url__)
+                    u_value = parse_property.url(
+                        el, base_url=self.__url__, trace=u_trace
+                    )
 
                 if root_class_names:
-                    prop_value.append(
-                        handle_microformat(
-                            root_class_names,
-                            el,
-                            value_property="url",
-                            simple_value=u_value,
-                            backcompat_mode=backcompat_mode,
-                        )
+                    mf, entity_shadow = handle_microformat(
+                        root_class_names,
+                        el,
+                        value_property="url",
+                        simple_value=u_value,
+                        backcompat_mode=backcompat_mode,
                     )
+                    prop_value.append(mf)
+                    attach(prop_name, entity_shadow)
                 else:
                     if isinstance(u_value, dict):
                         prop_value.append(u_value)
                     else:
                         prop_value.append(u_value)
+                    if u_trace is not None:
+                        leaf = u_trace[-1]
+                        if mf1_info is not None:
+                            leaf = dict(leaf, mf1=mf1_info)
+                        attach(prop_name, leaf)
 
             # Parse datetime dt-* properties.
             dt_value = None
+            dt_trace = [] if self.audit_enabled else None
             for prop_name in filtered_classes["dt"]:
                 is_property_el = True
                 parsed_types_aggregation.add("d")
@@ -398,27 +501,35 @@ class Parser(object):
 
                 # if value has not been parsed then parse it
                 if dt_value is None:
-                    dt_value, new_date = parse_property.datetime(el, self._default_date)
+                    dt_value, new_date = parse_property.datetime(
+                        el, self._default_date, trace=dt_trace
+                    )
                     # update the default date
                     if new_date:
                         self._default_date = new_date
 
                 if root_class_names:
                     stops_implied_name = True
-                    prop_value.append(
-                        handle_microformat(
-                            root_class_names,
-                            el,
-                            simple_value=dt_value,
-                            backcompat_mode=backcompat_mode,
-                        )
+                    mf, entity_shadow = handle_microformat(
+                        root_class_names,
+                        el,
+                        simple_value=dt_value,
+                        backcompat_mode=backcompat_mode,
                     )
+                    prop_value.append(mf)
+                    attach(prop_name, entity_shadow)
                 else:
                     if dt_value is not None:
                         prop_value.append(dt_value)
+                        if dt_trace is not None:
+                            leaf = dt_trace[-1]
+                            if mf1_info is not None:
+                                leaf = dict(leaf, mf1=mf1_info)
+                            attach(prop_name, leaf)
 
             # Parse embedded markup e-* properties.
             e_value = None
+            e_trace = [] if self.audit_enabled else None
             for prop_name in filtered_classes["e"]:
                 is_property_el = True
                 parsed_types_aggregation.add("e")
@@ -431,34 +542,55 @@ class Parser(object):
                         embedded_el = el
                     else:
                         embedded_el = el.original
+                    # provenance must reference the node in the parsed DOM,
+                    # not the working copy made when the document is preserved
+                    source_el = embedded_el
                     if self._preserve_doc:
                         embedded_el = copy.copy(embedded_el)
                     temp_fixes.rm_templates(embedded_el)
                     e_value = parse_property.embedded(
-                        embedded_el, self.__url__, root_lang, self.lang, self.expose_dom
+                        embedded_el,
+                        self.__url__,
+                        root_lang,
+                        self.lang,
+                        self.expose_dom,
+                        trace=e_trace,
                     )
+                    if e_trace is not None:
+                        for leaf in e_trace:
+                            for src in leaf["sources"]:
+                                if src.get("node") is embedded_el:
+                                    src["node"] = source_el
 
                 if root_class_names:
                     stops_implied_name = True
-                    prop_value.append(
-                        handle_microformat(
-                            root_class_names,
-                            el,
-                            simple_value=e_value,
-                            backcompat_mode=backcompat_mode,
-                        )
+                    mf, entity_shadow = handle_microformat(
+                        root_class_names,
+                        el,
+                        simple_value=e_value,
+                        backcompat_mode=backcompat_mode,
                     )
+                    prop_value.append(mf)
+                    attach(prop_name, entity_shadow)
                 else:
                     prop_value.append(e_value)
+                    if e_trace is not None:
+                        leaf = e_trace[-1]
+                        if mf1_info is not None:
+                            leaf = dict(leaf, mf1=mf1_info)
+                        attach(prop_name, leaf)
 
             # if this is not a property element, but it is a h-* microformat,
             # add it to our list of children
             if not is_property_el and root_class_names:
-                children.append(
-                    handle_microformat(
-                        root_class_names, el, backcompat_mode=backcompat_mode
-                    )
+                mf, entity_shadow = handle_microformat(
+                    root_class_names,
+                    el,
+                    backcompat_mode=backcompat_mode,
                 )
+                children.append(mf)
+                if self.audit_enabled:
+                    shadows["__children__"].append(entity_shadow)
             # parse child tags, provided this isn't a microformat root-class
             if not root_class_names:
                 for child in get_children(el):
@@ -466,6 +598,7 @@ class Parser(object):
                         child_properties,
                         child_microformats,
                         child_parsed_types_aggregation,
+                        child_shadows,
                     ) = parse_props(child, root_lang)
                     for prop_name in child_properties:
                         v = props.get(prop_name, [])
@@ -473,7 +606,13 @@ class Parser(object):
                         props[prop_name] = v
                     children.extend(child_microformats)
                     parsed_types_aggregation.update(child_parsed_types_aggregation)
-            return props, children, parsed_types_aggregation
+                    if self.audit_enabled:
+                        for prop_name, leaf_list in child_shadows.items():
+                            if prop_name == "__children__":
+                                shadows["__children__"].extend(leaf_list)
+                            else:
+                                shadows.setdefault(prop_name, []).extend(leaf_list)
+            return props, children, parsed_types_aggregation, shadows
 
         def parse_rels(el):
             """Parse an element for rel microformats"""
@@ -531,16 +670,23 @@ class Parser(object):
 
             # if potential microformats found parse them
             if potential_microformats:
-                result = handle_microformat(potential_microformats, el)
+                result, shadow = handle_microformat(potential_microformats, el)
                 ctx.append(result)
+                if self.audit_enabled:
+                    self._audit_shadows.append(shadow)
             else:
                 # find backcompat root classnames
                 potential_microformats = backcompat.root(classes)
                 if potential_microformats:
-                    result = handle_microformat(
-                        potential_microformats, el, backcompat_mode=True
+                    result, shadow = handle_microformat(
+                        potential_microformats,
+                        el,
+                        backcompat_mode=True,
+                        original_el=el,
                     )
                     ctx.append(result)
+                    if self.audit_enabled:
+                        self._audit_shadows.append(shadow)
                 else:
                     # parse child tags
                     for child in get_children(el):
@@ -557,6 +703,10 @@ class Parser(object):
         self.__parsed__["items"] = ctx
         if self.__metaformats and self.__metaformats_item:
             self.__parsed__["items"].append(self.__metaformats_item)
+            if self.audit_enabled:
+                # metaformats items are out of scope for provenance; keep the
+                # shadow list aligned with items by padding with None
+                self._audit_shadows.append(None)
 
         # parse for rel values
         for el in get_descendents(self.__doc__):
@@ -591,22 +741,126 @@ class Parser(object):
         else:
             return [x for x in self.__parsed__["items"] if filter_by_type in x["type"]]
 
-    def to_json(self, pretty_print=False, filter_by_type=None):
-        """Get a json-encoding string version of the parsed microformats document
+    def audit(self, filter_by_type=None):
+        """Return provenance entries for the parsed properties.
+
+        Only available when the parser was constructed with ``audit=True``;
+        the regular parse result (``to_dict``/``to_json``) is never modified
+        and contains no audit markers.
+
+        For every element of every ``properties`` array of every returned
+        h-* item (including nested entities and child items), an entry is
+        returned with:
+
+        * ``pointer`` (:rfc:`6901` JSON Pointer): location of the value in
+          the document returned by :meth:`to_dict`. When *filter_by_type* is
+          given, pointers are relative to the filtered list and still match
+          the values actually returned.
+        * ``rule`` (string): machine-readable extraction rule, e.g.
+          ``p-text``, ``u-attr-href``, ``dt-value-class-pattern``,
+          ``e-embedded``, ``implied-name-alt``, ...
+        * ``implied`` (bool): whether the value came from an implied-property
+          rule.
+        * ``mf1`` (dict, only for MF1 backcompat): the MF1 mapping that
+          produced the value, e.g. ``{"root": "vcard", "class": "fn"}`` or
+          ``{"root": "vcard", "rel": "tag"}``.
+        * ``sources`` (list): one dict per contributing raw fragment, in
+          contribution order. Each has a ``node_path`` (structural path of
+          the originating node in the *original* DOM), an optional
+          ``attribute`` (``href``/``alt``/``title``/``datetime``/
+          ``value``/``src``/``html``/...), and the raw ``value`` captured
+          before URL normalisation or whitespace processing. Different nodes
+          with identical text produce separate entries.
+
+        Args:
+          filter_by_type (string, optional): same filtering as
+            :meth:`to_dict`; returned pointers correspond to the filtered
+            result.
+
+        Returns:
+          list[dict]: provenance entries, sorted by JSON Pointer.
+
+        Raises:
+          RuntimeError: if auditing was not enabled at construction.
+        """
+        if not self.audit_enabled:
+            raise RuntimeError(
+                "provenance is only collected when Parser is constructed "
+                "with audit=True"
+            )
+
+        if self._audit_path_map is None:
+            self._audit_path_map = build_node_path_map(self.__doc__)
+
+        if filter_by_type is None:
+            return audit_entries(
+                self._audit_shadows,
+                self.__parsed__["items"],
+                self._audit_path_map,
+                pointer_prefix=("items",),
+                registry=self._audit_registry,
+            )
+
+        # compute pointers against the filtered result list itself, while
+        # keeping each entry aligned with the matching item through its shadow.
+        # Pair full-document indices up front so duplicate items can never be
+        # resolved to the wrong shadow.
+        items = self.__parsed__["items"]
+        filtered_pairs = [
+            (full_index, item)
+            for full_index, item in enumerate(items)
+            if filter_by_type in item["type"]
+        ]
+
+        out = []
+        for filtered_index, (full_index, item) in enumerate(filtered_pairs):
+            entries = audit_entries(
+                [self._audit_shadows[full_index]],
+                [item],
+                self._audit_path_map,
+                pointer_prefix=(),
+                registry=self._audit_registry,
+            )
+            # audit_entries produced pointers relative to a single-item list
+            # ("/0/..."); renumber to the position in the filtered list
+            for entry in entries:
+                parts = entry["pointer"].split("/", 2)
+                entry["pointer"] = (
+                    "/"
+                    + str(filtered_index)
+                    + (("/" + parts[2]) if len(parts) > 2 else "")
+                )
+                out.append(entry)
+        out.sort(key=lambda e: e["pointer"])
+        return out
+
+    def to_json(self, pretty_print=False, filter_by_type=None, include_audit=False):
+        """Get a json-encoding string version of the parsed microformat document
 
         Args:
           pretty_print (bool, optional): Encode the json document with
             linebreaks and indents to improve readability. Defaults to False.
           filter_by_type (bool, optional): only include top-level items of
             the given h-* type
+          include_audit (bool, optional): when True (and the parser was built
+            with ``audit=True``), wrap the document in an object with the
+            regular parse result under ``"document"`` and the provenance
+            entries under ``"audit"``. Defaults to False, in which case output
+            is identical to the non-audited parser.
 
         Returns:
             string: a json-encoded string
         """
 
-        if pretty_print:
-            return json.dumps(
-                self.to_dict(filter_by_type), indent=4, separators=(", ", ": ")
-            )
+        if include_audit:
+            payload = {
+                "document": self.to_dict(filter_by_type),
+                "audit": self.audit(filter_by_type),
+            }
         else:
-            return json.dumps(self.to_dict(filter_by_type))
+            payload = self.to_dict(filter_by_type)
+
+        if pretty_print:
+            return json.dumps(payload, indent=4, separators=(", ", ": "))
+        else:
+            return json.dumps(payload)

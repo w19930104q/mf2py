@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Audit provenance fixture</title>
+  </head>
+  <body>
+    <!-- top-level h-entry exercising nested entities, duplicate values and
+         every property type, plus combined value-class-pattern datetime -->
+    <article class="h-entry">
+      <h1 class="p-name">Audit Post</h1>
+      <a class="u-url" href="/posts/audit">permalink</a>
+      <div class="e-content">Hello <a href="/related">world</a></div>
+      <!-- two different nodes producing identical text must not be merged -->
+      <p class="p-summary">same text</p>
+      <p class="p-category">same text</p>
+      <!-- combined value-class-pattern datetime, contributions in order -->
+      <p class="dt-start">
+        <span class="value">2026-11-13</span>
+        <span class="value">18:30</span>
+        <span class="value">+09:00</span>
+      </p>
+      <!-- value-title contribution -->
+      <p class="p-location">
+        <span class="value-title" title="Tokyo"></span>
+      </p>
+      <!-- nested h-card entity with its own properties -->
+      <div class="h-card p-author">
+        <span class="p-name">Alice</span>
+        <a class="u-url" href="https://alice.example/">web</a>
+      </div>
+      <!-- u-* on an img, src needs normalisation, alt is a second source -->
+      <img class="u-photo" src="/img/audit.png" alt="Audit photo" />
+      <!-- implied photo and implied url live on a second h-card below -->
+    </article>
+
+    <div class="h-card">
+      <img src="/img/implicit.png" alt="Implicit photo" />
+      <a href="/people/bob">Bob</a>
+    </div>
+
+    <!-- MF1 backcompat: class mapping, nested MF1 root, rel=tag synthetic
+         element and an e-* backcompat property -->
+    <div class="hentry">
+      <span class="entry-title">Legacy entry</span>
+      <a rel="tag" href="https://example.com/tags/cat">cat label</a>
+      <div class="entry-content">Legacy <b>markup</b></div>
+      <div class="vcard">
+        <span class="fn">Carol</span>
+        <a class="url" href="/carol">home</a>
+      </div>
+    </div>
+  </body>
+</html>

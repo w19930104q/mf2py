@@ -1,8 +1,9 @@
 from . import mf2_classes
+from .audit import make_leaf, make_source
 from .dom_helpers import get_attr, get_children, get_img, get_textContent, try_urljoin
 
 
-def name(el, base_url, filtered_roots):
+def name(el, base_url, filtered_roots, trace=None):
     """Find an implied name property
 
     Args:
@@ -10,6 +11,8 @@ def name(el, base_url, filtered_roots):
 
     Returns:
       string: the implied name value
+
+    When *trace* is a list, an ``implied-*`` provenance leaf is appended.
     """
 
     def non_empty(val):
@@ -20,11 +23,27 @@ def name(el, base_url, filtered_roots):
     # if image or area use alt text if not empty
     prop_value = get_attr(el, "alt", check_name=("img", "area"))
     if non_empty(prop_value):
+        if trace is not None:
+            trace.append(
+                make_leaf(
+                    "implied-name-alt",
+                    [make_source(el, prop_value, "alt")],
+                    implied=True,
+                )
+            )
         return prop_value
 
     # if abbreviation use the title if not empty
     prop_value = get_attr(el, "title", check_name="abbr")
     if non_empty(prop_value):
+        if trace is not None:
+            trace.append(
+                make_leaf(
+                    "implied-name-title",
+                    [make_source(el, prop_value, "title")],
+                    implied=True,
+                )
+            )
         return prop_value
 
     # find candidate child or grandchild
@@ -54,20 +73,47 @@ def name(el, base_url, filtered_roots):
         # use alt if possible child is img or area
         prop_value = get_attr(poss_child, "alt", check_name=("img", "area"))
         if non_empty(prop_value):
+            if trace is not None:
+                trace.append(
+                    make_leaf(
+                        "implied-name-nested-alt",
+                        [make_source(poss_child, prop_value, "alt")],
+                        implied=True,
+                    )
+                )
             return prop_value
 
         # use title if possible child is abbr
         prop_value = get_attr(poss_child, "title", check_name="abbr")
         if non_empty(prop_value):
+            if trace is not None:
+                trace.append(
+                    make_leaf(
+                        "implied-name-nested-title",
+                        [make_source(poss_child, prop_value, "title")],
+                        implied=True,
+                    )
+                )
             return prop_value
 
     # use text if all else fails
     # replace images with alt but not with src in implied name
     # proposal: https://github.com/microformats/microformats2-parsing/issues/35#issuecomment-393615508
-    return get_textContent(el, replace_img=True, img_to_src=False, base_url=base_url)
+    text_value = get_textContent(
+        el, replace_img=True, img_to_src=False, base_url=base_url
+    )
+    if trace is not None:
+        trace.append(
+            make_leaf(
+                "implied-name-text",
+                [make_source(el, text_value)],
+                implied=True,
+            )
+        )
+    return text_value
 
 
-def photo(el, base_url, filtered_roots):
+def photo(el, base_url, filtered_roots, trace=None):
     """Find an implied photo property
 
     Args:
@@ -76,6 +122,9 @@ def photo(el, base_url, filtered_roots):
 
     Returns:
       string or dictionary: the implied photo value or implied photo as a dictionary with alt value
+
+    When *trace* is a list, an ``implied-*`` provenance leaf (with the raw,
+    pre-normalisation src) is appended.
     """
 
     def get_photo_child(children):
@@ -104,12 +153,25 @@ def photo(el, base_url, filtered_roots):
             prop_value = try_urljoin(base_url, prop_value)
         return prop_value
 
+    def record(rule, source_node, raw, attribute):
+        if trace is not None:
+            trace.append(
+                make_leaf(
+                    rule,
+                    [make_source(source_node, raw, attribute)],
+                    implied=True,
+                )
+            )
+
     # if element is an img use source if exists
     if prop_value := get_img(el, base_url):
+        raw_src = get_attr(el, "src", check_name="img")
+        record("implied-photo-src", el, raw_src, "src")
         return resolve_relative_url(prop_value)
 
     # if element is an object use data if exists
     if prop_value := get_attr(el, "data", check_name="object"):
+        record("implied-photo-data", el, prop_value, "data")
         return resolve_relative_url(prop_value)
 
     # find candidate child or grandchild
@@ -131,14 +193,17 @@ def photo(el, base_url, filtered_roots):
     if poss_child is not None:
         # img get src
         if prop_value := get_img(poss_child, base_url):
+            raw_src = get_attr(poss_child, "src", check_name="img")
+            record("implied-photo-nested-src", poss_child, raw_src, "src")
             return resolve_relative_url(prop_value)
 
         # object get data
         if prop_value := get_attr(poss_child, "data", check_name="object"):
+            record("implied-photo-nested-data", poss_child, prop_value, "data")
             return resolve_relative_url(prop_value)
 
 
-def url(el, base_url, filtered_roots):
+def url(el, base_url, filtered_roots, trace=None):
     """Find an implied url property
 
     Args:
@@ -147,6 +212,9 @@ def url(el, base_url, filtered_roots):
 
     Returns:
       string: the implied url value
+
+    When *trace* is a list, an ``implied-*`` provenance leaf (with the raw,
+    pre-normalisation href) is appended.
     """
 
     def get_url_child(children):
@@ -169,6 +237,14 @@ def url(el, base_url, filtered_roots):
     # if element is a <a> or area use its href if exists
     prop_value = get_attr(el, "href", check_name=("a", "area"))
     if prop_value is not None:  # an empty href is valid
+        if trace is not None:
+            trace.append(
+                make_leaf(
+                    "implied-url-href",
+                    [make_source(el, prop_value, "href")],
+                    implied=True,
+                )
+            )
         return try_urljoin(base_url, prop_value)
 
     # find candidate child or grandchild
@@ -190,4 +266,12 @@ def url(el, base_url, filtered_roots):
     if poss_child is not None:
         prop_value = get_attr(poss_child, "href", check_name=("a", "area"))
         if prop_value is not None:  # an empty href is valid
+            if trace is not None:
+                trace.append(
+                    make_leaf(
+                        "implied-url-nested-href",
+                        [make_source(poss_child, prop_value, "href")],
+                        implied=True,
+                    )
+                )
             return try_urljoin(base_url, prop_value)

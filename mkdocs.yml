@@ -13,6 +13,7 @@ extra_css:
 nav:
   - Home: index.md
   - Parser Object: parser.md
+  - Provenance / Audit: audit.md
   - Change Log: changelog.md
 
 theme:

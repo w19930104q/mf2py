@@ -37,6 +37,29 @@ from .mf_helpers import unordered_list
 # Classic map
 _CLASSIC_MAP = {}
 
+# Audit metadata for backcompat DOM copies. bs4's deepcopy does not preserve
+# arbitrary Python attributes set on Tag instances, so provenance metadata is
+# kept in external keyed tables rather than on the elements themselves.
+# Each ``apply_rules(audit=True)`` call creates a fresh registry; the Parser
+# holds onto the active registry for as long as it needs provenance.
+#   copied_tag -> original Tag from the unmodified parsed DOM
+#   copied_tag -> {"root": ..., "class"/"rel": ...} MF1 mapping info
+
+
+def _new_audit_registry():
+    return {"originals": {}, "mf1": {}}
+
+
+def audit_original(registry, tag):
+    """Return the original-DOM tag that backcompat copy *tag* derives from."""
+    return registry["originals"].get(id(tag))
+
+
+def audit_mf1(registry, tag):
+    """Return the MF1 mapping recorded for backcompat copy *tag*."""
+    return registry["mf1"].get(id(tag))
+
+
 # populate backcompat rules from JSON files
 
 _RULES_LOC = os.path.join(
@@ -52,7 +75,7 @@ for filename in os.listdir(_RULES_LOC):
     _CLASSIC_MAP[root] = rules
 
 
-def _make_classes_rule(old_classes, new_classes):
+def _make_classes_rule(old_classes, new_classes, root_name, audit, registry):
     """Builds a rule for augmenting an mf1 class with its mf2
     equivalent(s).
     """
@@ -68,10 +91,17 @@ def _make_classes_rule(old_classes, new_classes):
             if mf2_classes.has_embedded_class(child_classes) and child.original is None:
                 child.original = child_original
 
+            if audit:
+                # remember the MF1 -> MF2 class mapping that applied here
+                registry["mf1"][id(child)] = {
+                    "root": root_name,
+                    "class": " ".join(old_classes),
+                }
+
     return f
 
 
-def _rel_tag_to_category_rule(child, html_parser, **kwargs):
+def _rel_tag_to_category_rule(child, html_parser, root_name, audit, registry, **kwargs):
     """rel=tag converts to p-category using a special transformation (the
     category becomes the tag href's last path segment). This rule adds a new data tag so that
     <a rel="tag" href="http://example.com/tags/cat"></a> gets replaced with
@@ -94,13 +124,18 @@ def _rel_tag_to_category_rule(child, html_parser, **kwargs):
             # use mf1 class so it doesn't get removed later
             data["class"] = ["p-category"]
             data["value"] = unquote(segments[-1])
+            if audit:
+                # synthetic element; its original-DOM back-link (the source
+                # <a rel=tag>) is resolved in apply_rules after all rules run
+                registry["originals"][id(data)] = child
+                registry["mf1"][id(data)] = {"root": root_name, "rel": "tag"}
             child.insert_before(data)
             # remove tag from rels to avoid repeat
             # new list created, original not modifed -> safe on incomplete copy
             child["rel"] = [r for r in rels if r != "tag"]
 
 
-def _make_rels_rule(old_rels, new_classes, html_parser):
+def _make_rels_rule(old_rels, new_classes, html_parser, root_name, audit, registry):
     """Builds a rule for augmenting an mf1 rel with its mf2 class equivalent(s)."""
 
     # need to special case rel=tag as it operates differently
@@ -110,27 +145,41 @@ def _make_rels_rule(old_rels, new_classes, html_parser):
         child_classes = child.get("class", [])[:]
         if all(r in child_rels for r in old_rels):
             if "tag" in old_rels:
-                _rel_tag_to_category_rule(child, html_parser, **kwargs)
+                _rel_tag_to_category_rule(
+                    child, html_parser, root_name, audit, registry, **kwargs
+                )
             else:
                 child_classes.extend(
                     [cl for cl in new_classes if cl not in child_classes]
                 )
                 child["class"] = child_classes
+                if audit:
+                    registry["mf1"][id(child)] = {
+                        "root": root_name,
+                        "rel": " ".join(old_rels),
+                    }
 
     return f
 
 
-def _get_rules(old_root, html_parser):
+def _get_rules(old_root, html_parser, audit, registry):
     """for given mf1 root get the rules as a list of functions to act on children"""
 
     class_rules = [
-        _make_classes_rule(old_classes.split(), new_classes)
+        _make_classes_rule(old_classes.split(), new_classes, old_root, audit, registry)
         for old_classes, new_classes in _CLASSIC_MAP[old_root]
         .get("properties", {})
         .items()
     ]
     rel_rules = [
-        _make_rels_rule(old_rels.split(), new_classes, html_parser)
+        _make_rels_rule(
+            old_rels.split(),
+            new_classes,
+            html_parser,
+            old_root,
+            audit,
+            registry,
+        )
         for old_rels, new_classes in _CLASSIC_MAP[old_root].get("rels", {}).items()
     ]
 
@@ -142,13 +191,59 @@ def root(classes):
     return unordered_list([c for c in classes if c in _CLASSIC_MAP])
 
 
-def apply_rules(el, html_parser, filtered_roots):
+def apply_rules(el, html_parser, filtered_roots, audit=False, registry=None):
     """add modern classnames for older mf1 classnames
 
-    returns a copy of el and does not modify the original
+    returns a copy of el and does not modify the original. In audit mode a
+    *registry* (from :func:`_new_audit_registry`) records the mapping from
+    copied/synthetic elements back to the original DOM and the MF1 mapping
+    that was applied.
     """
 
     el_copy = copy.copy(el)
+    old_roots = root(el.get("class", []))
+
+    if audit:
+        originals = registry["originals"]
+        mf1_info = registry["mf1"]
+        originals[id(el_copy)] = el
+        mf1_info[id(el_copy)] = {"root": " ".join(old_roots)}
+
+        # bs4's copy is a deep copy, so node identity is not shared. After the
+        # rules run (which may insert synthetic elements), align the copy
+        # element-by-element with the original and record the back-link for
+        # every copied tag. Synthetic elements have no original counterpart in
+        # position and are resolved separately afterwards.
+        def tag_copies(original_node, copied_node):
+            orig_children = [
+                c for c in original_node.children if isinstance(c, bs4.Tag)
+            ]
+            copy_children = [c for c in copied_node.children if isinstance(c, bs4.Tag)]
+            real_copy_children = [c for c in copy_children if id(c) not in originals]
+            for orig_child, copy_child in zip(orig_children, real_copy_children):
+                originals[id(copy_child)] = orig_child
+                tag_copies(orig_child, copy_child)
+
+        def resolve_synthetics(copied_node):
+            """Rewrite synthetic elements' back-links: they currently point at
+            the copied source, replace it with the original source tag. Also
+            register back-links for the ``.original`` deep copies that e-*
+            rules create so embedded-markup provenance reaches the original
+            DOM."""
+            for child in copied_node.find_all(True):
+                source = originals.get(id(child))
+                if (
+                    source is not None
+                    and id(child) in mf1_info
+                    and "rel" in mf1_info[id(child)]
+                ):
+                    originals[id(child)] = originals.get(id(source), source)
+                embedded_original = getattr(child, "original", None)
+                if embedded_original is not None:
+                    if id(child) in originals:
+                        originals[id(embedded_original)] = originals[id(child)]
+                    else:
+                        originals[id(embedded_original)] = child
 
     def apply_prop_rules_to_children(parent, rules):
         for child in get_children(parent):
@@ -168,7 +263,6 @@ def apply_rules(el, html_parser, filtered_roots):
 
     # add mf2 root equivalent
     classes = el_copy.get("class", [])[:]
-    old_roots = root(classes)
     for old_root in old_roots:
         new_roots = _CLASSIC_MAP[old_root]["type"]
         classes.extend(new_roots)
@@ -176,9 +270,17 @@ def apply_rules(el, html_parser, filtered_roots):
 
     # add mf2 prop equivalent to descendents and remove existing mf2 props
     rules = []
-    for old_root in old_roots:
-        rules.extend(_get_rules(old_root, html_parser))
+    if audit:
+        for old_root in old_roots:
+            rules.extend(_get_rules(old_root, html_parser, audit, registry))
+    else:
+        for old_root in old_roots:
+            rules.extend(_get_rules(old_root, html_parser, audit, registry=None))
 
     apply_prop_rules_to_children(el_copy, rules)
+
+    if audit:
+        tag_copies(el, el_copy)
+        resolve_synthetics(el_copy)
 
     return el_copy
