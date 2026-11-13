@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta http-equiv="content-type" content="text/html; charset=utf-8">
+  <title>Source map regression fixture</title>
+</head>
+<body>
+  <!-- nested h-* microformat, same element carrying two properties -->
+  <article class="h-entry">
+    <h1 class="p-name">A post with provenance</h1>
+
+    <!-- nested h-card used by two different property names -->
+    <div class="p-author p-reviewer h-card">
+      <span class="p-name">Jane Doe</span>
+      <a class="u-url" href="/people/jane">jane</a>
+      <img class="u-photo" src="/img/jane.png" alt="Jane Doe portrait"/>
+    </div>
+
+    <!-- relative URL resolved against the document base -->
+    <a class="u-url" href="/posts/1">permalink</a>
+
+    <!-- split date/time via value-class-pattern -->
+    <span class="dt-published">
+      <data class="value" value="2024-05-21">21 May 2024</data>
+      <data class="value" value="18:30">6:30pm</data>
+      <span class="value">-06:00</span>
+    </span>
+
+    <!-- time-only dt that borrows the default date from dt-published -->
+    <span class="dt-updated">19:30</span>
+
+    <!-- value-title sourcing -->
+    <abbr class="p-duration" title="PT1H">one hour</abbr>
+
+    <!-- embedded markup -->
+    <div class="e-content">Some <em>embedded</em> markup.</div>
+
+    <!-- duplicated authored value coming from different elements -->
+    <span class="p-category">cats</span>
+    <span class="p-category">cats</span>
+
+    <!-- two properties on one node (text + URL of the same anchor) -->
+    <a class="p-name u-syndication" href="https://news.example.com/x">
+      syndicated copy
+    </a>
+  </article>
+
+  <!-- implied properties: plain h-card with no explicit p-name/u-url -->
+  <div class="h-card">
+    <a class="" href="/people/implicit">
+      <img src="/img/implicit.png" alt="Implicit Person"/>
+    </a>
+  </div>
+
+  <!-- microformats1 legacy class names -->
+  <div class="vcard">
+    <span class="fn">Legacy Card</span>
+    <a class="url" href="/people/legacy">legacy</a>
+  </div>
+</body>
+</html>

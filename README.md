@@ -111,6 +111,18 @@ found.
 Use `filter_roots=True` to filter known conflicting user names (e.g. Tailwind).
 Otherwise provide a custom list to filter instead.
 
+### `source_map`
+
+Use `source_map=True` to collect field provenance. The parsed document gains a
+`"source-map"` key mapping [JSON Pointers](https://datatracker.ietf.org/doc/html/rfc6901)
+of every property value to the original DOM path(s) and parsing rule
+(attribute, text, value-class-pattern, implied, back-compat mapping, ...).
+URL traces keep the pre-resolution value and the effective base URL, and
+composite datetimes list the separate date/time/timezone sources. It is off
+by default and leaves the output unchanged when disabled. See the
+[Field Provenance](https://microformats.github.io/mf2py/source_map/) docs for
+the trace format.
+
 ## Advanced Usage
 
 `parse` is a convenience function for `Parser`. More sophisticated behaviors are

@@ -1,6 +1,21 @@
 # Change Log
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### New Features
+- Add an optional `source_map` field-provenance feature. When enabled with
+  `source_map=True`, the parsed document gains a `"source-map"` key that maps
+  JSON Pointers of property values to their original DOM paths and the parsing
+  rule that produced them (attribute, text, value-class-pattern, value-title,
+  embedded, implied, back-compat mapping, composite datetime or metaformats).
+  URL traces record the pre-resolution value and effective base URL; composite
+  datetimes list their date/time/timezone sources, including the legacy
+  implied default-date rule. The feature is off by default and leaves the
+  output, value order and the caller's BeautifulSoup document unchanged.
+  `to_dict`, `to_json` and type filtering keep the pointers aligned with the
+  returned result.
+
 ## 2.0.2 - 2026-09-17
 This release adds support for Python 3.13 and 3.14.
 

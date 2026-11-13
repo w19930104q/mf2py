@@ -15,6 +15,7 @@ from . import (
 )
 from .dom_helpers import get_attr, get_children, get_descendents, try_urljoin
 from .mf_helpers import unordered_list
+from .source_map import SourceMap
 from .version import __version__
 
 
@@ -26,6 +27,7 @@ def parse(
     expose_dom=False,
     filter_roots=False,
     metaformats=False,
+    source_map=False,
 ):
     """
     Parse a document or URL for microformats and return a dictionary in mf2json format.
@@ -46,6 +48,10 @@ def parse(
         and Twitter card data: https://microformats.org/wiki/metaformats
       filter_roots (boolean or list): optional, filter root class names. Use
         True to filter known conflicting classes, otherwise filter given list.
+      source_map (boolean): optional, attach field provenance. When enabled the
+        returned document gains a "source-map" key mapping JSON Pointers of
+        properties to the original DOM paths and parsing rules that produced
+        them. Defaults to False; when False the output is unchanged.
 
     Return: a mf2json dict representing the structured data in the document
 
@@ -58,6 +64,7 @@ def parse(
         expose_dom=expose_dom,
         metaformats=metaformats,
         filter_roots=filter_roots,
+        source_map=source_map,
     ).to_dict()
 
 
@@ -81,6 +88,9 @@ class Parser(object):
         and Twitter card data: https://microformats.org/wiki/metaformats
       filter_roots (boolean or list): optional, filter root class names. Use
         True to filter known conflicting classes, otherwise filter given list.
+      source_map (boolean): optional, collect field provenance traces. See
+        :meth:`to_dict`, :meth:`to_json` and :meth:`source_map` for how the
+        traces are exposed. Defaults to False.
 
     Attributes:
       useragent (string): the User-Agent string for the Parser
@@ -100,6 +110,7 @@ class Parser(object):
         expose_dom=False,
         metaformats=False,
         filter_roots=False,
+        source_map=False,
     ):
         self.__url__ = None
         self.__doc__ = None
@@ -117,6 +128,8 @@ class Parser(object):
         self.lang = None
         self.expose_dom = expose_dom
         self.__metaformats = metaformats
+        self.source_map_enabled = source_map
+        self.__source_map__ = SourceMap() if source_map else None
         try:
             self.filtered_roots = set(filter_roots)
         except TypeError:
@@ -193,11 +206,36 @@ class Parser(object):
             # parse!
             self._parse()
 
+    def _backcompat_info(self, el):
+        """mf1 -> mf2 mapping metadata attached to a backcompat working copy."""
+        if not self.source_map_enabled:
+            return None
+        info = el.__dict__.get("mf2trace")
+        return info if info and info.get("kind") == "backcompat" else None
+
+    def _element_trace(self, el, info):
+        """Build a trace for a parsed value, folding in backcompat mapping."""
+        sm = self.__source_map__
+        trace = sm.text_trace(el, info)
+        backcompat_info = self._backcompat_info(el)
+        if backcompat_info is not None:
+            trace["kind"] = "backcompat"
+            trace["mapping"] = backcompat_info.get("mapping")
+            if backcompat_info.get("backcompat-root"):
+                trace["backcompat-root"] = backcompat_info["backcompat-root"]
+            # make sure the path points at the authored element, not the copy
+            trace["paths"] = sm.trace(
+                "backcompat", [backcompat_info.get("element", el)]
+            )["paths"]
+        return trace
+
     def _parse(self):
         """Does the work of actually parsing the document. Done automatically
         on initialization.
         """
+        sm = self.__source_map__
         self._default_date = None
+        self._default_date_source = None
         # _default_date exists to provide implementation for rules described
         # in legacy value-class-pattern. basically, if you have two dt-
         # properties and one does not have the full date, it can use the
@@ -210,24 +248,56 @@ class Parser(object):
             el,
             value_property=None,
             simple_value=None,
+            simple_value_trace=None,
             backcompat_mode=False,
         ):
             """Handles a (possibly nested) microformat, i.e. h-*"""
             properties = {}
             children = []
             self._default_date = None
+            self._default_date_source = None
             # for processing implied properties: collects if property types (p, e, u, d(t)) or children (h) have been processed
             parsed_types_aggregation = set()
 
             if backcompat_mode:
                 el = backcompat.apply_rules(
-                    el, self.__html_parser__, self.filtered_roots
+                    el,
+                    self.__html_parser__,
+                    self.filtered_roots,
+                    source_map=sm,
                 )
                 root_class_names = mf2_classes.root(
                     el.get("class", []), self.filtered_roots
                 )
 
             root_lang = el.attrs.get("lang")
+
+            # build microformat with type and properties
+            microformat = {
+                "type": [class_name for class_name in sorted(root_class_names)],
+                "properties": properties,
+            }
+
+            if self.source_map_enabled:
+                backcompat_info = self._backcompat_info(el)
+                if backcompat_mode or backcompat_info is not None:
+                    source_el = (
+                        backcompat_info.get("element", el)
+                        if backcompat_info is not None
+                        else el
+                    )
+                    extra = {}
+                    if backcompat_info is not None:
+                        if backcompat_info.get("backcompat-root"):
+                            extra["backcompat-root"] = backcompat_info[
+                                "backcompat-root"
+                            ]
+                        if backcompat_info.get("mapping"):
+                            extra["mapping"] = backcompat_info["mapping"]
+                    root_trace = sm.trace("backcompat", [source_el], **extra)
+                else:
+                    root_trace = sm.trace("attribute", [el], attribute="class")
+                sm.register_node(microformat, root_trace)
 
             # parse for properties and children
             for child in get_children(el):
@@ -247,6 +317,12 @@ class Parser(object):
             # first explicit property ("name" for p-* or "url" for u-*)
             if value_property and value_property in properties:
                 simple_value = properties[value_property][0]
+                if self.source_map_enabled:
+                    traces = sm.get_node(microformat)["properties"].get(
+                        value_property, []
+                    )
+                    if traces:
+                        simple_value_trace = traces[0]
 
             # if some properties not already found find in implied ways unless in backcompat mode
             if not backcompat_mode:
@@ -254,30 +330,65 @@ class Parser(object):
                 if "name" not in properties and parsed_types_aggregation.isdisjoint(
                     "peh"
                 ):
-                    properties["name"] = [
-                        implied_properties.name(el, self.__url__, self.filtered_roots)
-                    ]
+                    if self.source_map_enabled:
+                        implied, info = implied_properties.name(
+                            el,
+                            self.__url__,
+                            self.filtered_roots,
+                            trace=True,
+                        )
+                        properties["name"] = [implied]
+                        sm.attach_property("name", self._element_trace(el, info))
+                    else:
+                        properties["name"] = [
+                            implied_properties.name(
+                                el, self.__url__, self.filtered_roots
+                            )
+                        ]
 
                 if "photo" not in properties and parsed_types_aggregation.isdisjoint(
                     "uh"
                 ):
-                    x = implied_properties.photo(el, self.__url__, self.filtered_roots)
-                    if x is not None:
-                        properties["photo"] = [x]
+                    if self.source_map_enabled:
+                        implied_result = implied_properties.photo(
+                            el,
+                            self.__url__,
+                            self.filtered_roots,
+                            trace=True,
+                        )
+                        if implied_result is not None:
+                            implied, info = implied_result
+                            properties["photo"] = [implied]
+                            sm.attach_property("photo", self._element_trace(el, info))
+                    else:
+                        x = implied_properties.photo(
+                            el, self.__url__, self.filtered_roots
+                        )
+                        if x is not None:
+                            properties["photo"] = [x]
 
                 # stop implied url if any u-* or h-* is already found
                 if "url" not in properties and parsed_types_aggregation.isdisjoint(
                     "uh"
                 ):
-                    x = implied_properties.url(el, self.__url__, self.filtered_roots)
-                    if x is not None:
-                        properties["url"] = [x]
+                    if self.source_map_enabled:
+                        implied_result = implied_properties.url(
+                            el,
+                            self.__url__,
+                            self.filtered_roots,
+                            trace=True,
+                        )
+                        if implied_result is not None:
+                            implied, info = implied_result
+                            properties["url"] = [implied]
+                            sm.attach_property("url", self._element_trace(el, info))
+                    else:
+                        x = implied_properties.url(
+                            el, self.__url__, self.filtered_roots
+                        )
+                        if x is not None:
+                            properties["url"] = [x]
 
-            # build microformat with type and properties
-            microformat = {
-                "type": [class_name for class_name in sorted(root_class_names)],
-                "properties": properties,
-            }
             if el.name == "area":
                 shape = get_attr(el, "shape")
                 if shape is not None:
@@ -306,11 +417,16 @@ class Parser(object):
                     microformat.update(simple_value)
                 else:
                     microformat["value"] = simple_value
+                    if self.source_map_enabled and simple_value_trace is not None:
+                        sm.attach_value(simple_value_trace)
 
             if root_lang:
                 microformat["lang"] = root_lang
             elif self.lang:
                 microformat["lang"] = self.lang
+
+            if self.source_map_enabled:
+                sm.pop_node(microformat)
             return microformat
 
         def parse_props(el, root_lang):
@@ -340,6 +456,7 @@ class Parser(object):
 
             # Parse plaintext p-* properties.
             p_value = None
+            p_trace = None
             for prop_name in filtered_classes["p"]:
                 is_property_el = True
                 parsed_types_aggregation.add("p")
@@ -347,23 +464,36 @@ class Parser(object):
 
                 # if value has not been parsed then parse it
                 if p_value is None:
-                    p_value = parse_property.text(el, base_url=self.__url__)
+                    if self.source_map_enabled:
+                        p_value, p_info = parse_property.text(
+                            el, base_url=self.__url__, trace=True
+                        )
+                        p_trace = self._element_trace(el, p_info)
+                    else:
+                        p_value = parse_property.text(el, base_url=self.__url__)
 
                 if root_class_names:
-                    prop_value.append(
-                        handle_microformat(
-                            root_class_names,
-                            el,
-                            value_property="name",
-                            simple_value=p_value,
-                            backcompat_mode=backcompat_mode,
-                        )
+                    # traces produced inside belong to the nested node; the
+                    # outer property trace is attached again after it returns
+                    nested = handle_microformat(
+                        root_class_names,
+                        el,
+                        value_property="name",
+                        simple_value=p_value,
+                        simple_value_trace=p_trace,
+                        backcompat_mode=backcompat_mode,
                     )
+                    prop_value.append(nested)
+                    if self.source_map_enabled:
+                        sm.attach_property(prop_name, p_trace)
                 else:
                     prop_value.append(p_value)
+                    if self.source_map_enabled:
+                        sm.attach_property(prop_name, p_trace)
 
             # Parse URL u-* properties.
             u_value = None
+            u_trace = None
             for prop_name in filtered_classes["u"]:
                 is_property_el = True
                 parsed_types_aggregation.add("u")
@@ -371,26 +501,37 @@ class Parser(object):
 
                 # if value has not been parsed then parse it
                 if u_value is None:
-                    u_value = parse_property.url(el, base_url=self.__url__)
+                    if self.source_map_enabled:
+                        u_value, u_info = parse_property.url(
+                            el, base_url=self.__url__, trace=True
+                        )
+                        u_trace = self._element_trace(el, u_info)
+                    else:
+                        u_value = parse_property.url(el, base_url=self.__url__)
 
                 if root_class_names:
-                    prop_value.append(
-                        handle_microformat(
-                            root_class_names,
-                            el,
-                            value_property="url",
-                            simple_value=u_value,
-                            backcompat_mode=backcompat_mode,
-                        )
+                    nested = handle_microformat(
+                        root_class_names,
+                        el,
+                        value_property="url",
+                        simple_value=u_value,
+                        simple_value_trace=u_trace,
+                        backcompat_mode=backcompat_mode,
                     )
+                    prop_value.append(nested)
+                    if self.source_map_enabled:
+                        sm.attach_property(prop_name, u_trace)
                 else:
                     if isinstance(u_value, dict):
                         prop_value.append(u_value)
                     else:
                         prop_value.append(u_value)
+                    if self.source_map_enabled:
+                        sm.attach_property(prop_name, u_trace)
 
             # Parse datetime dt-* properties.
             dt_value = None
+            dt_trace = None
             for prop_name in filtered_classes["dt"]:
                 is_property_el = True
                 parsed_types_aggregation.add("d")
@@ -398,27 +539,43 @@ class Parser(object):
 
                 # if value has not been parsed then parse it
                 if dt_value is None:
-                    dt_value, new_date = parse_property.datetime(el, self._default_date)
+                    if self.source_map_enabled:
+                        dt_value, new_date, dt_info = parse_property.datetime(
+                            el,
+                            self._default_date,
+                            trace=True,
+                            default_date_source=self._default_date_source,
+                        )
+                        dt_trace = self._element_trace(el, dt_info)
+                    else:
+                        dt_value, new_date = parse_property.datetime(
+                            el, self._default_date
+                        )
                     # update the default date
                     if new_date:
                         self._default_date = new_date
+                        self._default_date_source = el
 
                 if root_class_names:
-                    stops_implied_name = True
-                    prop_value.append(
-                        handle_microformat(
-                            root_class_names,
-                            el,
-                            simple_value=dt_value,
-                            backcompat_mode=backcompat_mode,
-                        )
+                    nested = handle_microformat(
+                        root_class_names,
+                        el,
+                        simple_value=dt_value,
+                        simple_value_trace=dt_trace,
+                        backcompat_mode=backcompat_mode,
                     )
+                    prop_value.append(nested)
+                    if self.source_map_enabled and dt_value is not None:
+                        sm.attach_property(prop_name, dt_trace)
                 else:
                     if dt_value is not None:
                         prop_value.append(dt_value)
+                        if self.source_map_enabled:
+                            sm.attach_property(prop_name, dt_trace)
 
             # Parse embedded markup e-* properties.
             e_value = None
+            e_trace = None
             for prop_name in filtered_classes["e"]:
                 is_property_el = True
                 parsed_types_aggregation.add("e")
@@ -434,22 +591,43 @@ class Parser(object):
                     if self._preserve_doc:
                         embedded_el = copy.copy(embedded_el)
                     temp_fixes.rm_templates(embedded_el)
-                    e_value = parse_property.embedded(
-                        embedded_el, self.__url__, root_lang, self.lang, self.expose_dom
-                    )
+                    if self.source_map_enabled:
+                        e_value, e_info = parse_property.embedded(
+                            embedded_el,
+                            self.__url__,
+                            root_lang,
+                            self.lang,
+                            self.expose_dom,
+                            trace=True,
+                        )
+                        # the path must point at the authored DOM element
+                        authored = el.__dict__.get("original") or el
+                        e_info["element"] = authored
+                        e_trace = self._element_trace(el, e_info)
+                    else:
+                        e_value = parse_property.embedded(
+                            embedded_el,
+                            self.__url__,
+                            root_lang,
+                            self.lang,
+                            self.expose_dom,
+                        )
 
                 if root_class_names:
-                    stops_implied_name = True
-                    prop_value.append(
-                        handle_microformat(
-                            root_class_names,
-                            el,
-                            simple_value=e_value,
-                            backcompat_mode=backcompat_mode,
-                        )
+                    nested = handle_microformat(
+                        root_class_names,
+                        el,
+                        simple_value=e_value,
+                        simple_value_trace=e_trace,
+                        backcompat_mode=backcompat_mode,
                     )
+                    prop_value.append(nested)
+                    if self.source_map_enabled:
+                        sm.attach_property(prop_name, e_trace)
                 else:
                     prop_value.append(e_value)
+                    if self.source_map_enabled:
+                        sm.attach_property(prop_name, e_trace)
 
             # if this is not a property element, but it is a h-* microformat,
             # add it to our list of children
@@ -550,13 +728,21 @@ class Parser(object):
 
         if self.__metaformats:
             # extract out a metaformats item, if available
-            self.__metaformats_item = metaformats.parse(self.__doc__, url=self.__url__)
+            self.__metaformats_item = metaformats.parse(
+                self.__doc__, url=self.__url__, source_map=sm
+            )
 
         # start parsing at root element of the document
         parse_el(self.__doc__, ctx)
         self.__parsed__["items"] = ctx
         if self.__metaformats and self.__metaformats_item:
-            self.__parsed__["items"].append(self.__metaformats_item)
+            item = self.__metaformats_item
+            self.__parsed__["items"].append(item)
+            if self.source_map_enabled and sm.metaformats_traces:
+                sm.register_node(item)
+                for prop_name, info in sm.metaformats_traces.items():
+                    sm.attach_property(prop_name, sm.text_trace(info["element"], info))
+                sm.pop_node(item)
 
         # parse for rel values
         for el in get_descendents(self.__doc__):
@@ -584,21 +770,56 @@ class Parser(object):
             the given h-* type. Defaults to None.
 
         Returns:
-            dict: representation of the parsed microformats document
+            dict: representation of the parsed microformat document. When
+            source tracing is enabled and no type filter is given, the dict
+            gains a "source-map" key mapping JSON Pointers of properties to
+            their provenance traces. With a type filter the returned value is
+            still a list; use :meth:`source_map` to obtain the matching map.
         """
         if filter_by_type is None:
-            return self.__parsed__
+            if not self.source_map_enabled:
+                return self.__parsed__
+            result = copy.copy(self.__parsed__)
+            result["source-map"] = self.source_map()
+            return result
         else:
             return [x for x in self.__parsed__["items"] if filter_by_type in x["type"]]
 
+    def source_map(self, filter_by_type=None):
+        """Return the provenance map for the parsed document.
+
+        Args:
+          filter_by_type (string, optional): only include traces of top-level
+            items of the given h-* type. The JSON Pointers are rebased so that
+            ``/0`` addresses the first item of the filtered list returned by
+            ``to_dict(filter_by_type=...)``. Without a filter the pointers
+            keep their full ``/items/<n>`` form and match the complete
+            document.
+
+        Returns:
+            dict: a mapping from RFC 6901 JSON Pointer to a one-element list
+            of trace dictionaries. Returns an empty dict when source tracing
+            was not enabled.
+        """
+        if not self.source_map_enabled:
+            return {}
+        if filter_by_type is None:
+            return self.__source_map__.build(self.__parsed__["items"])
+        filtered = [x for x in self.__parsed__["items"] if filter_by_type in x["type"]]
+        # bare filtered list: rebase pointers from "/items/<n>" to "/<n>"
+        return self.__source_map__.build(filtered, prefix="")
+
     def to_json(self, pretty_print=False, filter_by_type=None):
-        """Get a json-encoding string version of the parsed microformats document
+        """Get a json-encoding string version of the parsed microformat document
 
         Args:
           pretty_print (bool, optional): Encode the json document with
             linebreaks and indents to improve readability. Defaults to False.
           filter_by_type (bool, optional): only include top-level items of
-            the given h-* type
+            the given h-* type. When source tracing is enabled and no filter
+            is supplied, the embedded "source-map" is serialised along with
+            the document. For a filtered list, serialise :meth:`source_map`
+            separately.
 
         Returns:
             string: a json-encoded string

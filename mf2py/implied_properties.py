@@ -2,7 +2,7 @@ from . import mf2_classes
 from .dom_helpers import get_attr, get_children, get_img, get_textContent, try_urljoin
 
 
-def name(el, base_url, filtered_roots):
+def name(el, base_url, filtered_roots, trace=False):
     """Find an implied name property
 
     Args:
@@ -17,15 +17,27 @@ def name(el, base_url, filtered_roots):
         name"""
         return val is not None and val != ""
 
+    def result(value, source_el, attribute=None):
+        if trace:
+            info = {
+                "kind": "implied",
+                "element": source_el,
+                "value": value,
+            }
+            if attribute is not None:
+                info["attribute"] = attribute
+            return value, info
+        return value
+
     # if image or area use alt text if not empty
     prop_value = get_attr(el, "alt", check_name=("img", "area"))
     if non_empty(prop_value):
-        return prop_value
+        return result(prop_value, el, "alt")
 
     # if abbreviation use the title if not empty
     prop_value = get_attr(el, "title", check_name="abbr")
     if non_empty(prop_value):
-        return prop_value
+        return result(prop_value, el, "title")
 
     # find candidate child or grandchild
     poss_child = None
@@ -54,20 +66,23 @@ def name(el, base_url, filtered_roots):
         # use alt if possible child is img or area
         prop_value = get_attr(poss_child, "alt", check_name=("img", "area"))
         if non_empty(prop_value):
-            return prop_value
+            return result(prop_value, poss_child, "alt")
 
         # use title if possible child is abbr
         prop_value = get_attr(poss_child, "title", check_name="abbr")
         if non_empty(prop_value):
-            return prop_value
+            return result(prop_value, poss_child, "title")
 
     # use text if all else fails
     # replace images with alt but not with src in implied name
     # proposal: https://github.com/microformats/microformats2-parsing/issues/35#issuecomment-393615508
-    return get_textContent(el, replace_img=True, img_to_src=False, base_url=base_url)
+    text_value = get_textContent(
+        el, replace_img=True, img_to_src=False, base_url=base_url
+    )
+    return result(text_value, el)
 
 
-def photo(el, base_url, filtered_roots):
+def photo(el, base_url, filtered_roots, trace=False):
     """Find an implied photo property
 
     Args:
@@ -104,13 +119,26 @@ def photo(el, base_url, filtered_roots):
             prop_value = try_urljoin(base_url, prop_value)
         return prop_value
 
+    def result(prop_value, source_el, attribute, raw_value):
+        if trace:
+            info = {
+                "kind": "implied",
+                "element": source_el,
+                "attribute": attribute,
+                "value": raw_value,
+                "base-url": base_url,
+            }
+            return prop_value, info
+        return prop_value
+
     # if element is an img use source if exists
     if prop_value := get_img(el, base_url):
-        return resolve_relative_url(prop_value)
+        raw = get_attr(el, "src", check_name="img")
+        return result(resolve_relative_url(prop_value), el, "src", raw)
 
     # if element is an object use data if exists
     if prop_value := get_attr(el, "data", check_name="object"):
-        return resolve_relative_url(prop_value)
+        return result(resolve_relative_url(prop_value), el, "data", prop_value)
 
     # find candidate child or grandchild
     poss_child = None
@@ -131,14 +159,17 @@ def photo(el, base_url, filtered_roots):
     if poss_child is not None:
         # img get src
         if prop_value := get_img(poss_child, base_url):
-            return resolve_relative_url(prop_value)
+            raw = get_attr(poss_child, "src", check_name="img")
+            return result(resolve_relative_url(prop_value), poss_child, "src", raw)
 
         # object get data
         if prop_value := get_attr(poss_child, "data", check_name="object"):
-            return resolve_relative_url(prop_value)
+            return result(
+                resolve_relative_url(prop_value), poss_child, "data", prop_value
+            )
 
 
-def url(el, base_url, filtered_roots):
+def url(el, base_url, filtered_roots, trace=False):
     """Find an implied url property
 
     Args:
@@ -166,10 +197,22 @@ def url(el, base_url, filtered_roots):
             if not mf2_classes.root(poss_area.get("class", []), filtered_roots):
                 return poss_area
 
+    def result(prop_value, source_el, raw_value):
+        if trace:
+            info = {
+                "kind": "implied",
+                "element": source_el,
+                "attribute": "href",
+                "value": raw_value,
+                "base-url": base_url,
+            }
+            return prop_value, info
+        return prop_value
+
     # if element is a <a> or area use its href if exists
     prop_value = get_attr(el, "href", check_name=("a", "area"))
     if prop_value is not None:  # an empty href is valid
-        return try_urljoin(base_url, prop_value)
+        return result(try_urljoin(base_url, prop_value), el, prop_value)
 
     # find candidate child or grandchild
     poss_child = None
@@ -190,4 +233,4 @@ def url(el, base_url, filtered_roots):
     if poss_child is not None:
         prop_value = get_attr(poss_child, "href", check_name=("a", "area"))
         if prop_value is not None:  # an empty href is valid
-            return try_urljoin(base_url, prop_value)
+            return result(try_urljoin(base_url, prop_value), poss_child, prop_value)

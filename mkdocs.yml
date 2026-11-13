@@ -13,6 +13,7 @@ extra_css:
 nav:
   - Home: index.md
   - Parser Object: parser.md
+  - Field Provenance: source_map.md
   - Change Log: changelog.md
 
 theme:

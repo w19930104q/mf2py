@@ -52,7 +52,7 @@ for filename in os.listdir(_RULES_LOC):
     _CLASSIC_MAP[root] = rules
 
 
-def _make_classes_rule(old_classes, new_classes):
+def _make_classes_rule(old_classes, new_classes, source_map=None):
     """Builds a rule for augmenting an mf1 class with its mf2
     equivalent(s).
     """
@@ -68,10 +68,21 @@ def _make_classes_rule(old_classes, new_classes):
             if mf2_classes.has_embedded_class(child_classes) and child.original is None:
                 child.original = child_original
 
+            if source_map is not None:
+                # only set on the working copy, never on the caller's DOM
+                child.mf2trace = {
+                    "kind": "backcompat",
+                    "element": child_original,
+                    "mapping": {
+                        "classes": old_classes,
+                        "properties": new_classes,
+                    },
+                }
+
     return f
 
 
-def _rel_tag_to_category_rule(child, html_parser, **kwargs):
+def _rel_tag_to_category_rule(child, html_parser, source_map=None, **kwargs):
     """rel=tag converts to p-category using a special transformation (the
     category becomes the tag href's last path segment). This rule adds a new data tag so that
     <a rel="tag" href="http://example.com/tags/cat"></a> gets replaced with
@@ -95,12 +106,21 @@ def _rel_tag_to_category_rule(child, html_parser, **kwargs):
             data["class"] = ["p-category"]
             data["value"] = unquote(segments[-1])
             child.insert_before(data)
+            # point the synthesised tag at the authored element so that its
+            # DOM path can be resolved on the caller's document
+            data.original = child.original or child
+            if source_map is not None:
+                data.mf2trace = {
+                    "kind": "backcompat",
+                    "element": child.original or child,
+                    "mapping": {"rels": ["tag"], "properties": ["p-category"]},
+                }
             # remove tag from rels to avoid repeat
             # new list created, original not modifed -> safe on incomplete copy
             child["rel"] = [r for r in rels if r != "tag"]
 
 
-def _make_rels_rule(old_rels, new_classes, html_parser):
+def _make_rels_rule(old_rels, new_classes, html_parser, source_map=None):
     """Builds a rule for augmenting an mf1 rel with its mf2 class equivalent(s)."""
 
     # need to special case rel=tag as it operates differently
@@ -110,27 +130,40 @@ def _make_rels_rule(old_rels, new_classes, html_parser):
         child_classes = child.get("class", [])[:]
         if all(r in child_rels for r in old_rels):
             if "tag" in old_rels:
-                _rel_tag_to_category_rule(child, html_parser, **kwargs)
+                _rel_tag_to_category_rule(
+                    child, html_parser, source_map=source_map, **kwargs
+                )
             else:
                 child_classes.extend(
                     [cl for cl in new_classes if cl not in child_classes]
                 )
                 child["class"] = child_classes
+                if source_map is not None:
+                    child.mf2trace = {
+                        "kind": "backcompat",
+                        "element": child.original or child,
+                        "mapping": {
+                            "rels": old_rels,
+                            "properties": new_classes,
+                        },
+                    }
 
     return f
 
 
-def _get_rules(old_root, html_parser):
+def _get_rules(old_root, html_parser, source_map=None):
     """for given mf1 root get the rules as a list of functions to act on children"""
 
     class_rules = [
-        _make_classes_rule(old_classes.split(), new_classes)
+        _make_classes_rule(old_classes.split(), new_classes, source_map=source_map)
         for old_classes, new_classes in _CLASSIC_MAP[old_root]
         .get("properties", {})
         .items()
     ]
     rel_rules = [
-        _make_rels_rule(old_rels.split(), new_classes, html_parser)
+        _make_rels_rule(
+            old_rels.split(), new_classes, html_parser, source_map=source_map
+        )
         for old_rels, new_classes in _CLASSIC_MAP[old_root].get("rels", {}).items()
     ]
 
@@ -142,7 +175,7 @@ def root(classes):
     return unordered_list([c for c in classes if c in _CLASSIC_MAP])
 
 
-def apply_rules(el, html_parser, filtered_roots):
+def apply_rules(el, html_parser, filtered_roots, source_map=None):
     """add modern classnames for older mf1 classnames
 
     returns a copy of el and does not modify the original
@@ -174,10 +207,36 @@ def apply_rules(el, html_parser, filtered_roots):
         classes.extend(new_roots)
     el_copy["class"] = classes
 
+    if source_map is not None:
+        # metadata lives on the working copy only; the caller's DOM is
+        # never touched
+        el_copy.original = el
+        el_copy.mf2trace = {
+            "kind": "backcompat",
+            "element": el,
+            "backcompat-root": list(old_roots),
+            "mapping": {root: _CLASSIC_MAP[root]["type"] for root in old_roots},
+        }
+
+        # bs4's copy detaches the working copy from the parse tree. Mirror
+        # every copied descendant back to its authored element so that DOM
+        # paths can be resolved against the caller's document.
+        def mirror_originals(copy_node, original_node):
+            copy_children = [c for c in copy_node.children if isinstance(c, bs4.Tag)]
+            original_children = [
+                c for c in original_node.children if isinstance(c, bs4.Tag)
+            ]
+            for copy_child, original_child in zip(copy_children, original_children):
+                if "original" not in copy_child.__dict__:
+                    copy_child.original = original_child
+                mirror_originals(copy_child, original_child)
+
+        mirror_originals(el_copy, el)
+
     # add mf2 prop equivalent to descendents and remove existing mf2 props
     rules = []
     for old_root in old_roots:
-        rules.extend(_get_rules(old_root, html_parser))
+        rules.extend(_get_rules(old_root, html_parser, source_map=source_map))
 
     apply_prop_rules_to_children(el_copy, rules)
 

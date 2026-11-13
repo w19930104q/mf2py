@@ -6,6 +6,7 @@ TODO:
 * explicit mf2 classes on meta tags
   https://microformats.org/wiki/metaformats#parsing_an_element_for_properties
 """
+
 from .dom_helpers import try_urljoin
 from .mf2_classes import filter_classes
 
@@ -43,12 +44,14 @@ URL_PROPERTIES = {
 }
 
 
-def parse(soup, url=None):
+def parse(soup, url=None, source_map=None):
     """Extracts and returns a metaformats item from a BeautifulSoup parse tree.
 
     Args:
       soup (bs4.BeautifulSoup): parsed HTML
       url (str): URL of document
+      source_map (mf2py.source_map.SourceMap): optional, collects provenance
+        traces when field source tracing is enabled
 
     Returns:
       dict: mf2 item, or None if the input is not eligible for metaformats
@@ -62,6 +65,7 @@ def parse(soup, url=None):
 
     parsed = {"properties": {}, "source": "metaformats"}
     props = parsed["properties"]
+    traces = {}
 
     # Properties
     for attr, meta, mf2 in METAFORMAT_TO_MF2:
@@ -69,11 +73,29 @@ def parse(soup, url=None):
             if content := val.get("content"):
                 if meta in URL_PROPERTIES:
                     content = try_urljoin(url, content)
-                props.setdefault(mf2, [content])
+                if mf2 not in props:
+                    props[mf2] = [content]
+                    if source_map is not None:
+                        traces[mf2] = {
+                            "kind": "metaformats",
+                            "element": val,
+                            "attribute": "content",
+                            "value": val.get("content"),
+                            "base-url": url if meta in URL_PROPERTIES else None,
+                            "meta-attribute": attr,
+                            "meta-name": meta,
+                        }
 
     if soup.head.title:
         if text := soup.head.title.text:
-            props.setdefault("name", [text])
+            if "name" not in props:
+                props["name"] = [text]
+                if source_map is not None:
+                    traces["name"] = {
+                        "kind": "metaformats",
+                        "element": soup.head.title,
+                        "value": text,
+                    }
 
     if not props:
         # No OGP or Twitter properties
@@ -85,5 +107,8 @@ def parse(soup, url=None):
         if content := ogp_type.get("content"):
             if mf2_type := OGP_TYPE_TO_MF2.get(content.split(".")[0]):
                 parsed["type"] = [mf2_type]
+
+    if source_map is not None:
+        source_map.metaformats_traces.update(traces)
 
     return parsed
