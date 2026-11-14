@@ -39,7 +39,9 @@ def datetime(el, default_date=None):
         date_parts = []
         for value_el in value_els:
             if "value-title" in value_el.get("class", []):
-                title = el.get("title")
+                # a value-title only contributes its own title attribute;
+                # never fall back to the parent element's title
+                title = value_el.get("title")
                 if title:
                     date_parts.append(title.strip())
             elif value_el.name in ("img", "area"):
@@ -64,6 +66,7 @@ def datetime(el, default_date=None):
                     date_parts.append(val.strip())
 
         date_part = time_part = tz_part = None
+        has_date_piece = False
 
         for part in date_parts:
             match = re.match(DATETIME_RE + "$", part)
@@ -77,10 +80,18 @@ def datetime(el, default_date=None):
                 time_part = part
             elif re.match(DATE_RE + "$", part) and date_part is None:
                 date_part = part
+                has_date_piece = True
             elif re.match(TIMEZONE_RE + "$", part) and tz_part is None:
                 tz_part = part
 
-        # use default date
+        # a property whose pieces contain no date or time (empty pieces or
+        # timezone-only pieces) must not produce a value, invent a date, or
+        # change the implied-date state
+        if not has_date_piece and time_part is None:
+            return None, None
+
+        # use the implied date of the enclosing root if the pieces only
+        # provide a time (and no date of their own)
         if date_part is None:
             date_part = default_date
 

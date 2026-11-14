@@ -197,13 +197,15 @@ class Parser(object):
         """Does the work of actually parsing the document. Done automatically
         on initialization.
         """
-        self._default_date = None
-        # _default_date exists to provide implementation for rules described
-        # in legacy value-class-pattern. basically, if you have two dt-
-        # properties and one does not have the full date, it can use the
-        # existing date as a template.
-        # see value-class-pattern#microformats2_parsers on wiki.
-        # see also the implied_relative_datetimes testcase.
+        # default_date implements the implied-date rule described in the
+        # legacy value-class-pattern:
+        # https://microformats.org/wiki/value-class-pattern#microformats2_parsers_implied_date
+        # a dt-* property without a full date uses the nearest preceding
+        # valid date authored inside the same microformat root (in document
+        # order). It is threaded as an explicit argument so that each nested
+        # root starts from an empty date and the parent's date is restored
+        # when the nested root finishes; sibling roots can never influence
+        # each other.
 
         def handle_microformat(
             root_class_names,
@@ -212,10 +214,18 @@ class Parser(object):
             simple_value=None,
             backcompat_mode=False,
         ):
-            """Handles a (possibly nested) microformat, i.e. h-*"""
+            """Handles a (possibly nested) h-* microformat.
+
+            A new root always starts with an empty implied date. When the
+            element itself also carries a dt-* property class, that
+            property's value is resolved by the caller against the
+            enclosing scope and passed in as ``simple_value``, while
+            properties nested inside the root start from an empty date.
+            """
             properties = {}
             children = []
-            self._default_date = None
+            # every microformat root gets its own empty implied date
+            root_default_date = None
             # for processing implied properties: collects if property types (p, e, u, d(t)) or children (h) have been processed
             parsed_types_aggregation = set()
 
@@ -235,7 +245,8 @@ class Parser(object):
                     child_props,
                     child_children,
                     child_parsed_types_aggregation,
-                ) = parse_props(child, root_lang)
+                    root_default_date,
+                ) = parse_props(child, root_lang, root_default_date)
                 for key, new_value in child_props.items():
                     prop_value = properties.get(key, [])
                     prop_value.extend(new_value)
@@ -313,8 +324,13 @@ class Parser(object):
                 microformat["lang"] = self.lang
             return microformat
 
-        def parse_props(el, root_lang):
-            """Parse the properties from a single element"""
+        def parse_props(el, root_lang, default_date):
+            """Parse the properties from a single element.
+
+            ``default_date`` is the implied date of the enclosing microformat
+            root. It is never mutated here; dt-* properties that establish a
+            new date return the updated value to the caller.
+            """
             props = {}
             children = []
             # for processing implied properties: collects if property types (p, e, u, d(t)) or children (h) have been processed
@@ -398,13 +414,18 @@ class Parser(object):
 
                 # if value has not been parsed then parse it
                 if dt_value is None:
-                    dt_value, new_date = parse_property.datetime(el, self._default_date)
-                    # update the default date
+                    dt_value, new_date = parse_property.datetime(el, default_date)
+                    # only a date actually found in this property updates the
+                    # implied date; times, timezones and empty values do not
                     if new_date:
-                        self._default_date = new_date
+                        default_date = new_date
 
                 if root_class_names:
                     stops_implied_name = True
+                    # the element itself is both a root and a dt property:
+                    # its own value was resolved against the enclosing scope
+                    # (default_date above), while the nested root's own
+                    # properties start from an empty implied date
                     prop_value.append(
                         handle_microformat(
                             root_class_names,
@@ -466,14 +487,15 @@ class Parser(object):
                         child_properties,
                         child_microformats,
                         child_parsed_types_aggregation,
-                    ) = parse_props(child, root_lang)
+                        default_date,
+                    ) = parse_props(child, root_lang, default_date)
                     for prop_name in child_properties:
                         v = props.get(prop_name, [])
                         v.extend(child_properties[prop_name])
                         props[prop_name] = v
                     children.extend(child_microformats)
                     parsed_types_aggregation.update(child_parsed_types_aggregation)
-            return props, children, parsed_types_aggregation
+            return props, children, parsed_types_aggregation, default_date
 
         def parse_rels(el):
             """Parse an element for rel microformats"""

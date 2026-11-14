@@ -3,7 +3,7 @@
 import re
 
 from . import value_class_pattern
-from .datetime_helpers import DATETIME_RE, TIME_RE, normalize_datetime
+from .datetime_helpers import DATE_RE, DATETIME_RE, TIME_RE, normalize_datetime
 from .dom_helpers import get_attr, get_img, get_textContent, try_urljoin
 
 
@@ -80,18 +80,33 @@ def datetime(el, default_date=None):
     if prop_value is None:
         prop_value = get_textContent(el)
 
-    # if this is just a time, augment with default date
+    # if this is just a time, augment with the implied date of the
+    # enclosing root
     match = re.match(TIME_RE + "$", prop_value)
-    if match and default_date:
-        prop_value = "%s %s" % (default_date, prop_value)
-        return normalize_datetime(prop_value), default_date
+    if match:
+        if default_date:
+            prop_value = "%s %s" % (default_date, prop_value)
+            return normalize_datetime(prop_value), default_date
+        # a bare time with no implied date stays a bare time and must not
+        # establish or change any date state
+        return prop_value, None
 
-    # otherwise, treat it as a full date
+    # a date-only property (with or without time) establishes the implied
+    # date for subsequent dt-* properties in the same root
     match = re.match(DATETIME_RE + "$", prop_value)
-    return (
-        normalize_datetime(prop_value, match=match),
-        match and match.group("date"),
-    )
+    if match:
+        return (
+            normalize_datetime(prop_value, match=match),
+            match.group("date"),
+        )
+
+    date_match = re.match(DATE_RE + "$", prop_value)
+    if date_match:
+        return prop_value, prop_value
+
+    # anything else (e.g. empty strings, durations, timezone-only values) is
+    # returned as authored and never produces a date or changes implied state
+    return normalize_datetime(prop_value), None
 
 
 def embedded(el, base_url, root_lang, document_lang, expose_dom):

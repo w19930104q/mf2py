@@ -1,6 +1,24 @@
 # Change Log
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Fixes
+- Scope the implied date of `dt-*` properties to the enclosing microformat
+  root. A nested root now starts from an empty implied date and the parent's
+  date is restored when the nested root finishes, so dates authored in child
+  (or sibling) microformats can no longer be applied to parent properties.
+- When an element is both a microformat root and a `dt-*` property, its own
+  value is resolved against the enclosing root's implied date while its
+  nested properties start from an empty date.
+- Plain date-only `dt-*` properties now establish the implied date just like
+  value-class-pattern date pieces.
+- `value-title` pieces are read from each piece's own `title` attribute
+  instead of the parent element's `title`.
+- Empty or timezone-only value-class-pattern pieces no longer crash, produce
+  a date, or change implied-date state; dateless times remain bare times and
+  no machine/current date is ever injected.
+
 ## 2.0.2 - 2026-09-17
 This release adds support for Python 3.13 and 3.14.
 
